@@ -60,8 +60,21 @@ def main():
     print("vLLM server is ready.")
     print("Press Ctrl+C to stop.")
 
-    while True:
-        time.sleep(3600)
+    return_code = server.process.wait()
+
+    if return_code == 0:
+        print("vLLM exited normally.")
+    elif return_code < 0:
+        signal_number = -return_code
+        signal_name = signal.Signals(signal_number).name
+        raise RuntimeError(
+            f"vLLM was terminated by {signal_name} ({signal_number})"
+        )
+    else:
+        raise RuntimeError(
+            f"vLLM exited unexpectedly with code {return_code}"
+        )
+        
 
 
 if __name__ == "__main__":

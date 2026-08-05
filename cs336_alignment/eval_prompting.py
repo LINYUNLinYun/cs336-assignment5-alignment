@@ -61,6 +61,10 @@ def evaluate(
     counter = Counter()
 
     with open(category2_file, "w") as f2, open(category3_file, "w") as f3:
+        if len(responses) != len(examples):
+            raise ValueError(
+                f"len(responses) != len(examples): {len(responses)} != {len(examples)}"
+            )
 
         for response, example in zip(responses, examples):
 
