@@ -355,6 +355,16 @@ val step = 200的验证集上抽查15条样本，特征是：
 
 > 中间有个小插曲，一个奇怪的bug，睡觉前开了tmux跑四个种子的zero r1训练，今天早上起来一看竟然只有seed42跑完了，后面的43刚开始跑。也就是说在我离开后训练只跑了一轮，本来怀疑是tmux的问题现在发现是代理导致的……因为服务器的代理会转发给我的笔记本，而笔记本早关机了，脚本里的wandb同步不成功就一直在那等待……所以只跑了一个任务。所以记得要在服务器跑脚本的时候把代理环境变量清空。
 
+#### zero r1 4个seed实验结果
+![alt text](/results/plots/train_format_reward.png)
+![alt text](/results/plots/train_grad_norm.png)
+![alt text](/results/plots/train_loss.png)
+![alt text](/results/plots/train_reward.png)
+![alt text](/results/plots/train_token_entropy.png)
+![alt text](/results/plots/val_format_reward.png)
+![alt text](/results/plots/val_reward.png)
+![alt text](/results/plots/val_avg_response_tokens.png)
+
 
 
 ## 5 RL algorithm 

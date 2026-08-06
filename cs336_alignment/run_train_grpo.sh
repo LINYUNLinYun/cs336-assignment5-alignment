@@ -18,7 +18,8 @@ RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_ROOT="results/${EXPERIMENT_NAME}_${RUN_STAMP}"
 LOG_ROOT="${OUTPUT_ROOT}/logs"
 
-SEEDS=(42 43 44 45)
+# SEEDS=(42 43 44 45)
+SEEDS=(44 45)
 
 # ============================================================
 # GPU 配置
@@ -39,9 +40,9 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 # 服务器可以直连 W&B，批量实验不要依赖代理
-unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
-unset http_proxy https_proxy all_proxy
-unset WANDB_BASE_URL
+# unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
+# unset http_proxy https_proxy all_proxy
+# unset WANDB_BASE_URL
 
 # ============================================================
 # W&B 配置
