@@ -60,30 +60,71 @@ def tokenize_prompt_and_output(
         ),
     }
 
+# def get_response_log_probs(
+#     model: PreTrainedModel, input_ids: torch.Tensor, 
+#     labels: torch.Tensor, return_token_entropy: bool = False, 
+#     ) -> dict[str, torch.Tensor]:
+#     """
+#     需要已经shift的输入
+#     """
+    
+#     probs = model(input_ids).logits
+
+#     log_probs = torch.log_softmax(probs, dim=-1)
+
+#     token_log_probs = torch.gather(
+#         log_probs,
+#         dim=-1,
+#         index=labels.unsqueeze(-1),
+#     ).squeeze(-1)
+#     # 注意交叉熵是对分布做的
+#     result = {}
+#     result["log_probs"] = token_log_probs
+#     # result["token_entropy"] = None
+#     if(return_token_entropy):
+#         entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+#         result["token_entropy"] = entropy
+#     return result
+
 def get_response_log_probs(
-    model: PreTrainedModel, input_ids: torch.Tensor, 
-    labels: torch.Tensor, return_token_entropy: bool = False, 
+    model: PreTrainedModel, input_ids: torch.Tensor,
+    labels: torch.Tensor, return_token_entropy: bool = False,
     ) -> dict[str, torch.Tensor]:
     """
-    需要已经shift的输入
+    需要已经 shift 的 input_ids 和 labels。
     """
-    
-    probs = model(input_ids).logits
+    logits = model(input_ids).logits
 
-    log_probs = torch.log_softmax(probs, dim=-1)
-
-    token_log_probs = torch.gather(
-        log_probs,
+    log_normalizer = torch.logsumexp(logits, dim=-1)
+    token_logits = torch.gather(
+        logits,
         dim=-1,
         index=labels.unsqueeze(-1),
     ).squeeze(-1)
-    # 注意交叉熵是对分布做的
+
     result = {}
-    result["log_probs"] = token_log_probs
-    # result["token_entropy"] = None
-    if(return_token_entropy):
-        entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    result["log_probs"] = token_logits - log_normalizer
+
+    if return_token_entropy:
+        entropy = torch.empty(
+            logits.shape[:-1],
+            dtype=torch.float32,
+            device=logits.device,
+        )
+
+        with torch.no_grad():
+            chunk_size = 16
+            for start in range(0, logits.shape[1], chunk_size):
+                end = min(start + chunk_size, logits.shape[1])
+                chunk_logits = logits[:, start:end].detach().float()
+                chunk_probs = torch.softmax(chunk_logits, dim=-1)
+                expected_logits = chunk_probs.mul_(chunk_logits).sum(dim=-1)
+                entropy[:, start:end] = (
+                    torch.logsumexp(chunk_logits, dim=-1) - expected_logits
+                )
+
         result["token_entropy"] = entropy
+
     return result
 
 def compute_rollout_rewards(
@@ -161,13 +202,15 @@ def compute_group_normalized_rewards(
     if baseline == "mean":
         advantages = (grouped_raw_rewards - group_means) 
     else:
+        # baseline == none
         advantages = grouped_raw_rewards
     if advantage_normalizer == "std":
         advantages /= (group_stds + advantage_eps)
     elif advantage_normalizer == "mean":
-        raise NotImplementedError
+        advantages /= group_means
     else:
-        raise NotImplementedError
+        # advantage_normalizer == none
+        pass
 
     advantages = advantages.reshape_as(raw_rewards)
     metadata = {"reward_mean": raw_rewards.mean().item(),
@@ -187,7 +230,7 @@ def compute_policy_gradient_loss(
     response_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-        如果我理解没错的话，
+        计算奖励加权损失。如果我理解没错的话，
         raw_rewards_or_advantages: [b,] or [b,1]
         policy_log_probs: [b, max_seq_len]
     """
@@ -234,18 +277,20 @@ def aggregate_loss_across_microbatch(
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
     ) -> torch.Tensor:
+    # 先一个序列内token wise mean 这里bool会在运算时自动转类型
+    mask_loss = per_token_policy_gradient_loss * mask
     if loss_normalization == "sequence":
-        pass
+        mask_sum = mask.sum(dim=-1, )
+        sequence_loss = mask_loss.sum(dim=-1, ) / mask_sum
+        aggregate_loss = sequence_loss.mean(dim=0)
+        
     if loss_normalization == "constant":
         if normalization_constant is None:
             raise ValueError(f"normalization: {normalization_constant}")
-        raise NotImplementedError
+        # 这里是全部加起来再除常数
+        aggregate_loss = mask_loss.sum() / normalization_constant
 
-    # 先一个序列内token wise mean 这里bool会在运算时自动转类型
-    mask_loss = per_token_policy_gradient_loss * mask
-    mask_sum = mask.sum(dim=-1, )
-    sequence_loss = mask_loss.sum(dim=-1, ) / mask_sum
-    aggregate_loss = sequence_loss.mean(dim=0)
+        # raise NotImplementedError
 
     return aggregate_loss
 

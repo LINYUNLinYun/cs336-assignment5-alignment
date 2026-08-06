@@ -217,6 +217,7 @@ def run_compute_policy_gradient_loss(
     return compute_policy_gradient_loss(
         raw_rewards_or_advantages,policy_log_probs,
         importance_reweighting_method,
+        old_log_probs,cliprange,response_mask
         )
 
 
@@ -251,7 +252,7 @@ def run_aggregate_loss_across_microbatch(
     """
     # raise NotImplementedError
     from cs336_alignment.grpo import aggregate_loss_across_microbatch
-    return aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask,loss_normalization)
+    return aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask,loss_normalization,normalization_constant)
 
 
 def run_grpo_train_step(
