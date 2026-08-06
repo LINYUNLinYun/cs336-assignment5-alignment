@@ -207,7 +207,7 @@ def compute_group_normalized_rewards(
     if advantage_normalizer == "std":
         advantages /= (group_stds + advantage_eps)
     elif advantage_normalizer == "mean":
-        advantages /= group_means
+        advantages /= (group_means + advantage_eps)
     else:
         # advantage_normalizer == none
         pass
@@ -326,10 +326,10 @@ def grpo_train_step(
         f"ground_truths={len(repeated_ground_truths)}"
     )
 
-    input_len = len(rollout_responses)
-    if input_len % group_size != 0:
+    input_ids_num = len(rollout_responses)
+    if input_ids_num % group_size != 0:
         raise ValueError("Batch size must be divisible by group_size")
-    if gradient_accumulation_steps <= 0 or gradient_accumulation_steps >input_len:
+    if gradient_accumulation_steps <= 0 or gradient_accumulation_steps >input_ids_num:
         raise ValueError("unvalid gradient_accumulation_steps ")
 
     device = next(model.parameters()).device
@@ -341,34 +341,45 @@ def grpo_train_step(
     total_loss = torch.zeros((), device=device)
     
     # 这里要分micro batch 据说是为了防止显存溢出
-    microbatch_size = input_len // gradient_accumulation_steps
+    microbatch_size = input_ids_num // gradient_accumulation_steps
 
     entropy_sum = torch.zeros((), device=device)
     response_token_count = torch.zeros((), device=device)
-    for i in range(0, input_len, microbatch_size):
+
+    non_zero_advantage = normed_advantage.nonzero(as_tuple=False).flatten().tolist()
+
+    for i in range(0, len(non_zero_advantage), microbatch_size):
+        # 剪枝：只让非零advantage参与训练
+        active_indices = non_zero_advantage[i: i + microbatch_size]
+        microbatch_advantage = normed_advantage[active_indices]
+        microbatch_prompts = [repeated_prompts[x] for x in active_indices]
+        microbatch_responses = [rollout_responses[x] for x in active_indices]
+
         # 记得设成none
         # 选择在循环里分词 防止对全局max len 做pad
-        tokenized_result = tokenize_prompt_and_output(repeated_prompts[i:i + microbatch_size],rollout_responses[i:i + microbatch_size],tokenizer)
+        tokenized_result = tokenize_prompt_and_output(microbatch_prompts,microbatch_responses,tokenizer)
         # 计算 ids labels 这里记得移动数据 因为分词器一般cpu运行
         input_ids = tokenized_result["input_ids"].to(device)
         labels = tokenized_result["labels"].to(device)
         response_mask  = tokenized_result["response_mask"].to(device)
 
         # 计算 log probs 这个要model 推理，所以不能放循环外，节省显存
-        log_probs, token_entropy =  get_response_log_probs(model,input_ids,labels,return_token_entropy=True).values()
-        entropy_sum += (token_entropy * response_mask).sum().detach()
+        log_probs, active_token_entropy =  get_response_log_probs(model,input_ids,labels,return_token_entropy=True).values()
+        entropy_sum += (active_token_entropy * response_mask).sum().detach()
         response_token_count += response_mask.sum().detach()
         # 计算进步加权的梯度，当前仅计算baseline = mean，std，序列归一化的
         if importance_reweighting_method == "none":
-            per_token_policy_gradient_loss,loss_metadata =compute_policy_gradient_loss(normed_advantage[i:i + microbatch_size],log_probs,importance_reweighting_method) 
+            per_token_policy_gradient_loss,loss_metadata =compute_policy_gradient_loss(microbatch_advantage,log_probs,importance_reweighting_method) 
         else:
             raise NotImplementedError
         # 聚合不同序列的损失
         if loss_normalization == "sequence":
-            loss = aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask,loss_normalization)
+            loss = aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask,loss_normalization,)
+            loss = loss*len(input_ids)/input_ids_num    # 
+        elif loss_normalization == "constant":
+            loss = aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask,loss_normalization,normalization_constant)
         else:
-            raise NotImplementedError
-        loss = loss*len(input_ids)/input_len
+            raise ValueError(f"error: {loss_normalization}")
         # 这里要立即反向 以便计算图释放
         total_loss+= loss.detach()
         loss.backward()
