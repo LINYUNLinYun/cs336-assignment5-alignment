@@ -80,6 +80,45 @@ def parse_args() -> argparse.Namespace:
         default="online",
     )
     parser.add_argument("--wandb-sample-count", type=int, default=16)
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        choices=["mean", "none"],
+        default="mean",
+    )
+
+    parser.add_argument(
+        "--advantage-normalizer",
+        type=str,
+        choices=["std", "none", "mean"],
+        default="std",
+    )
+
+    parser.add_argument(
+        "--advantage-eps",
+        type=float,
+        default=1e-6,
+    )
+
+    parser.add_argument(
+        "--importance-reweighting-method",
+        type=str,
+        choices=["none", "noclip", "grpo", "gspo"],
+        default="none",
+    )
+
+    parser.add_argument(
+        "--loss-normalization",
+        type=str,
+        choices=["sequence", "constant"],
+        default="sequence",
+    )
+
+    parser.add_argument(
+        "--normalization-constant",
+        type=int,
+        default=None,
+    )
     return parser.parse_args()
 
 
@@ -546,11 +585,14 @@ def main() -> None:
                 rollout_responses=rollout_responses,
                 repeated_ground_truths=repeated_ground_truths,
                 group_size=args.group_size,
-                baseline="mean",
-                advantage_eps=1e-6,
-                advantage_normalizer="std",
-                importance_reweighting_method="none",
-                loss_normalization="sequence",
+                baseline=args.baseline,
+                advantage_eps=args.advantage_eps,
+                advantage_normalizer=args.advantage_normalizer,
+                importance_reweighting_method=args.importance_reweighting_method,
+                old_log_probs=None,
+                cliprange=None,
+                loss_normalization=args.loss_normalization,
+                normalization_constant=args.normalization_constant,
             )
             train_seconds = time.perf_counter() - train_start
 

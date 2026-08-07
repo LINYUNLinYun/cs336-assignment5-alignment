@@ -6,14 +6,14 @@ import pandas as pd
 
 
 RUN_FILES = {
-    42: "results/standard_on_policy_r1_zero_20260805_214508/seed_42/metrics.jsonl",
-    43: "results/standard_on_policy_r1_zero_20260805_214508/seed_43/metrics.jsonl",
-    44: "results/standard_on_policy_r1_zero_20260806_121645/seed_44/metrics.jsonl",
-    45: "results/standard_on_policy_r1_zero_20260806_121645/seed_45/metrics.jsonl",
+    42: "results/on_policy_variants_gpu23_r1_zero_20260806_212044/rft/seed_42/metrics.jsonl",
+    43: "results/on_policy_variants_gpu23_r1_zero_20260806_212044/rft/seed_43/metrics.jsonl",
+    44: "results/on_policy_variants_gpu23_r1_zero_20260806_212044/rft/seed_44/metrics.jsonl",
+    45: "results/on_policy_variants_gpu23_r1_zero_20260806_212044/rft/seed_45/metrics.jsonl",
 }
 
 STEP_COL = "step"
-
+OUTPUT_DIR = "results/plots/on_policy/rft"
 METRICS = {
     "train/loss": "Loss",
     "train/grad_norm": "Gradient norm",
@@ -89,7 +89,7 @@ def plot_metric(
 
     plt.xlabel("Rollout step")
     plt.ylabel(title)
-    plt.title(f"{title} across 4 seeds")
+    plt.title(f"{OUTPUT_DIR.split('/')[-1]}: {title} across 4 seeds")
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -113,7 +113,7 @@ def main():
             print(f"Skip missing metric: {metric}")
             continue
 
-        plot_metric(df, metric, title)
+        plot_metric(df, metric, title,OUTPUT_DIR)
 
 
 if __name__ == "__main__":

@@ -13,19 +13,20 @@ PROMPT="r1_zero"
 TRAIN_DATA="data/gsm8k/train.jsonl"
 VAL_DATA="data/gsm8k/test.jsonl"
 
-EXPERIMENT_NAME="learning_rate_sweep_${PROMPT}"
+EXPERIMENT_NAME="on_policy_variants_gpu01_${PROMPT}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_ROOT="results/${EXPERIMENT_NAME}_${RUN_STAMP}"
 LOG_ROOT="${OUTPUT_ROOT}/logs"
 
-# 使用与默认学习率实验相同的随机种子，便于公平比较
-SEEDS=(44 45)
+SEEDS=(42 43 44 45)
 
-# 1e-5 的 seed 44、45 已经跑过，因此这里只跑新的学习率
-LEARNING_RATES=(1e-5)
+# GPU 0、1 负责这两个变体
+VARIANTS=(
+    "grpo_constant"
+    "dr_grpo"
+)
 
-# 如果希望重新完整跑一遍三个学习率，改成：
-# LEARNING_RATES=(5e-6 1e-5 2e-5)
+LEARNING_RATE=1e-5
 
 # ============================================================
 # GPU 配置
@@ -34,7 +35,7 @@ LEARNING_RATES=(1e-5)
 unset CUDA_VISIBLE_DEVICES
 
 TRAIN_GPU=0
-VLLM_GPU=2
+VLLM_GPU=1
 VLLM_PORT=8000
 VLLM_GPU_MEMORY_UTILIZATION=0.80
 
@@ -57,7 +58,6 @@ export WANDB_CACHE_DIR="${OUTPUT_ROOT}/wandb_cache"
 
 # ============================================================
 # GRPO 超参数
-# 除 learning rate 外，全部保持与标准实验相同
 # ============================================================
 
 N_TRAIN_EXAMPLES=6400
@@ -69,12 +69,15 @@ TRAIN_BATCH_SIZE=256
 GROUP_SIZE=8
 GRADIENT_ACCUMULATION_STEPS=128
 
+ADVANTAGE_EPS=1e-6
 MAX_GRAD_NORM=1.0
 
 SAMPLING_TEMPERATURE=1.0
 SAMPLING_TOP_P=1.0
 SAMPLING_MAX_TOKENS=512
 VLLM_REQUEST_BATCH_SIZE=64
+
+NORMALIZATION_CONSTANT=$((TRAIN_BATCH_SIZE * SAMPLING_MAX_TOKENS))
 
 EVAL_INTERVAL=10
 ROLLOUT_LOG_INTERVAL=40
@@ -88,42 +91,82 @@ mkdir -p \
     "${WANDB_CACHE_DIR}"
 
 BLUE="\033[1;34m"
+YELLOW="\033[1;33m"
 RESET="\033[0m"
 
 printf "${BLUE}======================================================================================${RESET}\n"
-printf "${BLUE}=============================== LR SWEEP TRAINING START ==============================${RESET}\n"
+printf "${BLUE}======================= ON-POLICY VARIANTS: GPU 0 + GPU 1 ============================${RESET}\n"
 printf "${BLUE}======================================================================================${RESET}\n"
 
-echo "Model          : ${MODEL}"
-echo "Prompt         : ${PROMPT}"
-echo "Learning rates : ${LEARNING_RATES[*]}"
-echo "Seeds          : ${SEEDS[*]}"
-echo "Output root    : ${OUTPUT_ROOT}"
-echo "W&B project    : ${WANDB_PROJECT}"
-echo "W&B entity     : ${WANDB_ENTITY}"
+echo "Model                  : ${MODEL}"
+echo "Prompt                 : ${PROMPT}"
+echo "Variants               : ${VARIANTS[*]}"
+echo "Seeds                  : ${SEEDS[*]}"
+echo "Train GPU              : ${TRAIN_GPU}"
+echo "vLLM GPU               : ${VLLM_GPU}"
+echo "vLLM port              : ${VLLM_PORT}"
+echo "Learning rate          : ${LEARNING_RATE}"
+echo "Normalization constant : ${NORMALIZATION_CONSTANT}"
+echo "Output root            : ${OUTPUT_ROOT}"
 echo "======================================================================================"
 
-for LEARNING_RATE in "${LEARNING_RATES[@]}"; do
-    LR_OUTPUT_ROOT="${OUTPUT_ROOT}/lr_${LEARNING_RATE}"
-    LR_LOG_ROOT="${LOG_ROOT}/lr_${LEARNING_RATE}"
+for VARIANT in "${VARIANTS[@]}"; do
+    case "${VARIANT}" in
+        grpo_constant)
+            BASELINE="mean"
+            ADVANTAGE_NORMALIZER="std"
+            LOSS_NORMALIZATION="constant"
+            ;;
+        dr_grpo)
+            BASELINE="mean"
+            ADVANTAGE_NORMALIZER="none"
+            LOSS_NORMALIZATION="constant"
+            ;;
+        *)
+            echo "Unknown variant: ${VARIANT}"
+            exit 1
+            ;;
+    esac
 
-    mkdir -p "${LR_OUTPUT_ROOT}" "${LR_LOG_ROOT}"
+    VARIANT_OUTPUT_ROOT="${OUTPUT_ROOT}/${VARIANT}"
+    VARIANT_LOG_ROOT="${LOG_ROOT}/${VARIANT}"
+
+    mkdir -p "${VARIANT_OUTPUT_ROOT}" "${VARIANT_LOG_ROOT}"
+
+    printf "\n${YELLOW}======================================================================================${RESET}\n"
+    printf "${YELLOW}Variant: ${VARIANT}${RESET}\n"
+    echo "baseline             : ${BASELINE}"
+    echo "advantage normalizer : ${ADVANTAGE_NORMALIZER}"
+    echo "loss normalization   : ${LOSS_NORMALIZATION}"
+    printf "${YELLOW}======================================================================================${RESET}\n"
 
     for SEED in "${SEEDS[@]}"; do
-        RUN_NAME="${EXPERIMENT_NAME}-lr${LEARNING_RATE}-seed${SEED}-${RUN_STAMP}"
-        RUN_OUTPUT="${LR_OUTPUT_ROOT}/seed_${SEED}"
-        RUN_LOG="${LR_LOG_ROOT}/seed_${SEED}.log"
+        RUN_NAME="${EXPERIMENT_NAME}-${VARIANT}-seed${SEED}-${RUN_STAMP}"
+        RUN_OUTPUT="${VARIANT_OUTPUT_ROOT}/seed_${SEED}"
+        RUN_LOG="${VARIANT_LOG_ROOT}/seed_${SEED}.log"
+        DONE_FILE="${RUN_OUTPUT}/.done"
 
         mkdir -p "${RUN_OUTPUT}"
+
+        if [[ -f "${DONE_FILE}" ]]; then
+            echo "Skipping completed run: variant=${VARIANT}, seed=${SEED}"
+            continue
+        fi
 
         echo
         echo "======================================================================================"
         echo "Starting run"
-        echo "Learning rate : ${LEARNING_RATE}"
-        echo "Seed          : ${SEED}"
-        echo "Run name      : ${RUN_NAME}"
-        echo "Output        : ${RUN_OUTPUT}"
-        echo "Log           : ${RUN_LOG}"
+        echo "Variant               : ${VARIANT}"
+        echo "Seed                  : ${SEED}"
+        echo "Train GPU             : ${TRAIN_GPU}"
+        echo "vLLM GPU              : ${VLLM_GPU}"
+        echo "Baseline              : ${BASELINE}"
+        echo "Advantage normalizer  : ${ADVANTAGE_NORMALIZER}"
+        echo "Loss normalization    : ${LOSS_NORMALIZATION}"
+        echo "Normalization constant: ${NORMALIZATION_CONSTANT}"
+        echo "Run name              : ${RUN_NAME}"
+        echo "Output                : ${RUN_OUTPUT}"
+        echo "Log                   : ${RUN_LOG}"
         echo "======================================================================================"
 
         uv run python -m cs336_alignment.train_grpo \
@@ -142,6 +185,12 @@ for LEARNING_RATE in "${LEARNING_RATES[@]}"; do
             --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
             --learning-rate "${LEARNING_RATE}" \
             --max-grad-norm "${MAX_GRAD_NORM}" \
+            --baseline "${BASELINE}" \
+            --advantage-normalizer "${ADVANTAGE_NORMALIZER}" \
+            --advantage-eps "${ADVANTAGE_EPS}" \
+            --importance-reweighting-method "none" \
+            --loss-normalization "${LOSS_NORMALIZATION}" \
+            --normalization-constant "${NORMALIZATION_CONSTANT}" \
             --sampling-temperature "${SAMPLING_TEMPERATURE}" \
             --sampling-top-p "${SAMPLING_TOP_P}" \
             --sampling-max-tokens "${SAMPLING_MAX_TOKENS}" \
@@ -163,13 +212,14 @@ for LEARNING_RATE in "${LEARNING_RATES[@]}"; do
             --wandb-sample-count "${WANDB_SAMPLE_COUNT}" \
             2>&1 | tee "${RUN_LOG}"
 
-        echo "Finished: learning_rate=${LEARNING_RATE}, seed=${SEED}"
+        touch "${DONE_FILE}"
+        echo "Finished: variant=${VARIANT}, seed=${SEED}"
     done
 done
 
 echo
 echo "======================================================================================"
-echo "All learning-rate sweep runs completed"
+echo "GPU 0 + GPU 1 experiments completed"
 echo "Results: ${OUTPUT_ROOT}"
 echo "Logs   : ${LOG_ROOT}"
 echo "======================================================================================"
