@@ -357,18 +357,18 @@ val step = 200的验证集上抽查15条样本，特征是：
 
 #### zero r1 4个seed实验结果
 训练平均梯度范数从0开始缓慢增长到1左右稳定；seed=42开始几乎没有梯度是正常的，因为奖励为0：
-![alt text](/results/plots/train_grad_norm.png)
+![alt text](/results/plots/on_policy/grpo/train_grad_norm.png)
 损失从刚开始接近0，下降到0.02附近剧烈波动，是正常的。因为做了均值baseline，正负 advantage 会互相抵消。
-![alt text](/results/plots/train_loss.png)
+![alt text](/results/plots/on_policy/grpo/train_loss.png)
 下图 GRPO 明显提高了模型在训练 rollout 上的正确率，并在大约 100 步后进入平台期，随机种子的差别集中在前期：
-![alt text](/results/plots/train_reward.png)
+![alt text](/results/plots/on_policy/grpo/train_reward.png)
 下图显示了随着训练进行，模型的 next-token 分布变得更加尖锐，模型对输出越来越确定，采样多样性明显降低。该现象和 reward 上升同步：正确 rollout 被不断提高概率后，模型逐渐集中到少量高奖励的推理和输出模式：
-![alt text](/results/plots/train_token_entropy.png)
+![alt text](/results/plots/on_policy/grpo/train_token_entropy.png)
 val format reward从开始的0.5左右快速上升到0.9+，这说明训练非常有效地教会了模型遵循格式去回答，后面几乎没有出现格式上的错误：
-![alt text](/results/plots/train_format_reward.png)
-![alt text](/results/plots/val_format_reward.png)
+![alt text](/results/plots/on_policy/grpo/train_format_reward.png)
+![alt text](/results/plots/on_policy/grpo/val_format_reward.png)
 val reward最后稳定再在0.4几，刚开始几乎是0，这说明了grpo的有效性：
-![alt text](/results/plots/val_reward.png)
+![alt text](/results/plots/on_policy/grpo/val_reward.png)
 平均验证回答长度从约 100 tokens 上升到 150～160 tokens，并在大约第 60 步后趋于稳定。这说明模型经过训练后倾向于生成更完整的推理过程，而不是只生成很短或者格式不完整的回答。回答长度没有持续增长到最大生成长度 512，因此暂时看不到明显的长度失控或刻意拖长回答的问题，同时不同seed的模型长度差别很大，这说明不同 seed 可能学到了不同的推理风格：
 ![alt text](/results/plots/val_avg_response_tokens.png)
 
@@ -472,7 +472,7 @@ $$
 
 ---
 
-### （a）Dr. GRPO
+**（a）Dr. GRPO**：
 
 当 $G\to\infty$ 时，根据大数定律，组内平均奖励收敛为
 
@@ -523,7 +523,7 @@ $$
 
 ---
 
-### （b）GRPO
+**（b）GRPO**
 
 标准 GRPO 会进一步将 advantage 除以组内奖励的标准差。
 
@@ -615,7 +615,7 @@ $$
 
 ---
 
-### （c）MaxRL
+**（c）MaxRL**
 
 MaxRL 使用组内平均奖励作为 advantage 的归一化因子。
 
@@ -750,5 +750,260 @@ $$
 | 除以 `std`  | 平衡不同组的更新尺度  | 改变目标，极端成功率处权重较大 |
 | 除以 `mean` | 强调困难问题      | $\mu$ 很小时可能不稳定  |
 | 不归一化      | 更接近原始期望奖励目标 | 不同组梯度尺度不一致      |
+
+
+### 5.4 Experiments
+#### 算法优化
+主要是把advantage（注意区分进步和奖励的区别）为0的样本从forward和backward中去掉了，因为无论是在grpo还是变体中，adv的贡献为0的，最终对梯度的影响都为0；
+
+起到了节省计算的结果，实测原本要70-90分钟200个steps的训练，优化进了60分钟内。
+
+以下是五种类型的算法变体的分析：
+- grpo:标准实现，baseline是组内平均奖励，advantage除以组内标准差；
+- grpo_constant:baseline是组内平均奖励，advantage除以std，常数归一化；
+- dr.grpo:baseline是组内平均奖励，advantage为none，常数归一化；
+- maxrl:baseline是组内平均奖励，advantage除以组内平均奖励，常数归一化；
+- rft:baseline是none，advantage为0的样本不参与训练，advantage为none，常数归一化；
+
+都跑4个seed，学习率1e-5
+
+#### 实验结果
+1. grpo：val reward平均在0.46左右，收敛；最好的seed=45，有接近0.50的val reward。
+2. grpo_constant：val reward平均在0.43左右，弱收敛，波动比较大；最好的seed=45，有接近0.45的val reward。format相对最高，说明有很好的格式遵循能力。
+3. dr.grpo：平均val reward本来收敛在0.45左右，但是最后有两个seeds reward骤降，原因不明；最好的seed=45，有接近0.48的val reward。
+4. maxrl：虽然train reward还行，但是平均val reward收敛0.43左右，比较拉；最好的seed=42，有接近0.45的val reward。
+5. rft：类似监督学习，平均val reward收敛0.42左右，比较拉；最好的seed=44，有接近0.43的val reward。不过这个train reward就比较一般。
+
+**Controlled comparisons：**
+
+Standard GRPO vs GRPO_constant：唯一主要变化是 loss normalization 从 sequence 变为 constant。结果上 GRPO_constant 没有超过 Standard GRPO，最终 validation reward 略低，seed 波动也不小。这说明在这组固定超参数下，去掉 sequence length normalization 没有带来明确收益。
+
+GRPO_constant vs Dr_GRPO：主要变化是 advantage normalization 从 std 变为 none。Dr_GRPO 明显更差，且 grad norm 更低、entropy 更高，说明 std normalization 对稳定放大学习信号很重要。这个对比是五组里最清楚的负面结果。
+
+Dr_GRPO vs RFT：RFT 去掉 mean baseline 后反而明显优于 Dr_GRPO，说明在本实验中，“只从正 reward 响应学习”的信号比 Dr_GRPO 的设置更有效。不过 RFT 的 seed 方差较大，不能仅凭最高终点断言它严格优于所有 GRPO 变体。
+
+GRPO_constant vs MaxRL：MaxRL 把 advantage normalizer 从 std 改成 mean，最终 validation reward 明显高于 GRPO_constant，并接近或略高于 Standard GRPO。但 MaxRL 的 grad norm 更大、波动更强，因此它可能更需要单独学习率或梯度裁剪调参。
+
+1. grpo_constant的val reward, format reward, per token entropy曲线如下：
+![alt text](/results/plots/on_policy/grpo_constant/val_reward.png)
+![none](/results/plots/on_policy/grpo_constant/val_format_reward.png)
+![none](/results/plots/on_policy/grpo_constant/train_loss.png)
+
+2. dr.grpo的val reward, format reward, per token entropy曲线如下：
+![alt text](/results/plots/on_policy/dr_grpo/val_reward.png)
+![none](/results/plots/on_policy/dr_grpo/val_format_reward.png)
+![none](/results/plots/on_policy/dr_grpo/train_loss.png)
+
+3. maxrl的val reward, format reward, per token entropy曲线如下：
+![alt text](/results/plots/on_policy/maxrl/val_reward.png)
+![none](/results/plots/on_policy/maxrl/val_format_reward.png)
+![none](/results/plots/on_policy/maxrl/train_loss.png)
+
+4. rft的val reward, format reward, per token entropy曲线如下：
+![alt text](/results/plots/on_policy/rft/val_reward.png)
+![none](/results/plots/on_policy/rft/val_format_reward.png)
+![none](/results/plots/on_policy/rft/train_loss.png)
+
+结果有点奇怪，因为我这些变体没有一个打过了原始的grpo，这当然不是说grpo变体没用，而是确实在复用grpo的学习率等超参数的情况下，其他变体没有超过grpo。文档直言可能需要进一步调参，也许吧。
+
+
+
+
+## Off-policy RL
+
+### 6.1 importance sampling
+都是理论跳过
+
+### 6.2 PPO/GRPO-style importance reweighting and clipping
+
+#### Pairwise Importance Reweighting 的 Surrogate Objective
+
+设 $\tilde{\pi}^{\text{pair}}_t$ 表示第 $t$ 个 token pair 对应的替代策略。
+
+该策略只在位置 $2t-1$ 和 $2t$ 使用当前策略 $\pi_\theta$，其余位置仍然使用生成 rollout 时的旧策略 $\pi_0$。
+
+因此：
+
+$$
+\tilde{\pi}^{\text{pair}}_t(y\mid x)
+=
+\left(
+\prod_{s=1}^{2t-2}
+\pi_0(y_s\mid x,y_{<s})
+\right)
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+\left(
+\prod_{s=2t+1}^{L}
+\pi_0(y_s\mid x,y_{<s})
+\right)
+$$
+
+也就是说，对于每一对相邻 token $(2t-1,2t)$：
+
+- 这两个 token 使用当前策略 $\pi_\theta$；
+- 其余 token 使用旧策略 $\pi_0$。
+
+因此，这种 pairwise importance reweighting 实际优化的 surrogate objective 为：
+
+$$
+J_\theta^{\text{pair}}
+=
+\mathbb E_{x\sim\rho}
+\left[
+\sum_{t=1}^{L/2}
+\mathbb E_{y\sim\tilde{\pi}^{\text{pair}}_t(y\mid x)}
+[r(y\mid x)]
+\right]
+$$
+
+即：对于每一对相邻 token，构造一个替代策略，使这两个 token 由当前策略 $\pi_\theta$ 生成，而其他 token 仍由旧策略 $\pi_0$ 生成，然后最大化这些替代策略下的期望 reward 之和。
+
+为了证明这一点，可以把在替代策略 $\tilde{\pi}^{\text{pair}}_t$ 下的期望，改写成在旧策略 $\pi_0$ 下采样并进行 importance reweighting。
+
+由于 $\tilde{\pi}^{\text{pair}}_t$ 与 $\pi_0$ 只在位置 $2t-1$ 和 $2t$ 不同，因此：
+
+$$
+\frac{
+\tilde{\pi}^{\text{pair}}_t(y\mid x)
+}{
+\pi_0(y\mid x)
+}
+=
+\frac{
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+}{
+\pi_0(y_{2t-1}\mid x,y_{<2t-1})
+\pi_0(y_{2t}\mid x,y_{<2t})
+}
+$$
+
+因此目标函数可以写成：
+
+$$
+J_\theta^{\text{pair}}
+=
+\mathbb E_{x\sim\rho}
+\mathbb E_{y\sim\pi_0}
+\left[
+\sum_{t=1}^{L/2}
+\frac{
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+}{
+\pi_0(y_{2t-1}\mid x,y_{<2t-1})
+\pi_0(y_{2t}\mid x,y_{<2t})
+}
+r(y\mid x)
+\right]
+$$
+
+接下来对 $\theta$ 求梯度。
+
+使用 log-derivative trick：
+
+$$
+\nabla_\theta f_\theta
+=
+f_\theta\nabla_\theta\log f_\theta
+$$
+
+其中令：
+
+$$
+f_\theta
+=
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+$$
+
+则：
+
+$$
+\nabla_\theta f_\theta
+=
+f_\theta
+\nabla_\theta
+\log
+\left[
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+\right]
+$$
+
+代入后得到：
+
+$$
+\nabla_\theta J_\theta^{\text{pair}}
+=
+\mathbb E_{x\sim\rho}
+\mathbb E_{y\sim\pi_0}
+\left[
+\sum_{t=1}^{L/2}
+\frac{
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+}{
+\pi_0(y_{2t-1}\mid x,y_{<2t-1})
+\pi_0(y_{2t}\mid x,y_{<2t})
+}
+r(y\mid x)
+\nabla_\theta
+\log
+\left(
+\pi_\theta(y_{2t-1}\mid x,y_{<2t-1})
+\pi_\theta(y_{2t}\mid x,y_{<2t})
+\right)
+\right]
+$$
+
+这正好与题目给出的 pairwise policy gradient estimator 相同。
+
+因此，该估计器优化的就是：
+
+$$
+\boxed{
+J_\theta^{\text{pair}}
+=
+\mathbb E_{x\sim\rho}
+\left[
+\sum_{t=1}^{L/2}
+\mathbb E_{y\sim\tilde{\pi}^{\text{pair}}_t}
+[r(y\mid x)]
+\right]
+}
+$$
+
+
+token-level importance reweighting 相当于：
+
+$$
+\boxed{\text{每次只把 1 个 token 从 }\pi_0\text{ 替换成 }\pi_\theta}
+$$
+
+pairwise importance reweighting 相当于：
+
+$$
+\boxed{\text{每次把 2 个相邻 token 从 }\pi_0\text{ 替换成 }\pi_\theta}
+$$
+
+sequence-level importance reweighting则相当于：
+
+$$
+\boxed{\text{把整条 sequence 的所有 token 都替换成 }\pi_\theta}
+$$
+
+因此 pairwise 方法可以理解为介于 token-level 和 sequence-level 之间的一种重要性重加权方式。
+
+### 6.3 GSPO
+
+不同的 importance reweighting 方法是在 bias 和 variance 之间进行权衡。
+
+不使用 importance reweighting 的方法具有最低的 variance，但由于忽略了 $\pi_\theta$ 和 $\pi_0$ 之间的分布差异，因此会产生最大的 bias，适用于策略变化较小的情况。
+
+PPO/GRPO 风格的 token-level importance reweighting 通过修正每个 token 的概率变化降低了 off-policy bias，并通过 clipping 控制 variance，是一种较好的折中方案。
+
+GSPO 使用 sequence-level importance reweighting 的 geometric mean，更充分地考虑整个 response 的策略变化，同时避免完整 sequence ratio 带来的高 variance，因此可能更适合长 reasoning sequence 或策略变化较大的场景，但 geometric mean 和 clipping 也会引入额外 bias。
 
 

@@ -3,6 +3,7 @@ models/
 results/standard*
 results/learning_rate*
 results/on_policy*
+results/off*
 wandb/
 nav
 tags

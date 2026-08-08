@@ -11,7 +11,7 @@ import torch
 
 from cs336_alignment.checkpoint import get_model_and_tokenizer
 from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
-from cs336_alignment.grpo import grpo_train_step
+from cs336_alignment.grpo import get_response_log_probs, grpo_train_step, tokenize_prompt_and_output
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
 
 
@@ -23,7 +23,7 @@ PROMPT_FILES = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Standard on-policy GRPO on GSM8K")
+    parser = argparse.ArgumentParser(description="GRPO on GSM8K with on-policy and off-policy training")
 
     parser.add_argument("--model", default="allenai/OLMo-2-0425-1B")
     parser.add_argument("--prompt", default="r1_zero")
@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--cliprange",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
         "--loss-normalization",
         type=str,
         choices=["sequence", "constant"],
@@ -132,23 +138,28 @@ def validate_args(args: argparse.Namespace) -> None:
             f"Requested GPUs {args.train_gpu} and {args.vllm_gpu}, "
             f"but only {torch.cuda.device_count()} CUDA devices are visible."
         )
-    if args.rollout_batch_size != args.train_batch_size:
-        raise ValueError(
-            "Standard on-policy GRPO uses every fresh rollout exactly once, so "
-            "rollout_batch_size must equal train_batch_size."
-        )
     if args.rollout_batch_size % args.group_size != 0:
         raise ValueError("rollout_batch_size must be divisible by group_size.")
+    if args.rollout_batch_size % args.train_batch_size != 0:
+        raise ValueError("rollout_batch_size must be divisible by train_batch_size.")
+    if args.train_batch_size % args.group_size != 0:
+        raise ValueError(
+            "train_batch_size must be divisible by group_size so each optimizer "
+            "step contains complete GRPO groups."
+        )
     if args.train_batch_size % args.gradient_accumulation_steps != 0:
         raise ValueError(
             "train_batch_size must be divisible by gradient_accumulation_steps "
             "for the current grpo_train_step implementation."
         )
+    if args.cliprange is not None and args.cliprange <= 0:
+        raise ValueError("cliprange must be positive.")
     for name in (
         "n_train_examples",
         "n_val_examples",
         "num_rollout_steps",
         "rollout_batch_size",
+        "train_batch_size",
         "group_size",
         "gradient_accumulation_steps",
         "sampling_max_tokens",
@@ -156,6 +167,14 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive.")
+
+
+def resolve_cliprange(args: argparse.Namespace) -> float | None:
+    if args.importance_reweighting_method == "grpo":
+        return 0.2 if args.cliprange is None else args.cliprange
+    if args.importance_reweighting_method == "gspo":
+        return 3e-4 if args.cliprange is None else args.cliprange
+    return None
 
 
 def set_seed(seed: int) -> None:
@@ -392,9 +411,79 @@ def wandb_table(wandb_module, records: list[dict[str, Any]], limit: int):
     return wandb_module.Table(columns=columns, data=data)
 
 
+def compute_old_log_prob_batches(
+    model,
+    tokenizer,
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    train_batch_size: int,
+) -> list[torch.Tensor]:
+    """Score the whole rollout with the rollout policy before any optimizer step."""
+    device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+    old_log_prob_batches = []
+    try:
+        with torch.no_grad():
+            for start in range(0, len(rollout_responses), train_batch_size):
+                end = start + train_batch_size
+                tokenized = tokenize_prompt_and_output(
+                    repeated_prompts[start:end],
+                    rollout_responses[start:end],
+                    tokenizer,
+                )
+                input_ids = tokenized["input_ids"].to(device)
+                labels = tokenized["labels"].to(device)
+                old_log_probs = get_response_log_probs(
+                    model,
+                    input_ids,
+                    labels,
+                    return_token_entropy=False,
+                )["log_probs"]
+                old_log_prob_batches.append(old_log_probs.detach().cpu())
+    finally:
+        model.train(was_training)
+    return old_log_prob_batches
+
+
+def aggregate_train_metadata(
+    weighted_metadata: list[tuple[int, dict[str, Any]]],
+) -> dict[str, float]:
+    total_weight = sum(weight for weight, _ in weighted_metadata)
+    if total_weight == 0:
+        raise ValueError("Cannot aggregate empty training metadata.")
+
+    result: dict[str, float] = {}
+    keys = {
+        "loss",
+        "grad_norm",
+        "token_entropy",
+        "mean_rewards",
+        "mean_reward",
+        "mean_format_reward",
+        "mean_answer_reward",
+        "clip_fraction",
+    }
+    for key in keys:
+        values = []
+        for weight, metadata in weighted_metadata:
+            if key not in metadata:
+                continue
+            value = metadata[key]
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().item()
+            values.append((weight, float(value)))
+        if values:
+            denom = sum(weight for weight, _ in values)
+            result[key] = sum(weight * value for weight, value in values) / denom
+    return result
+
+
 def scalar_train_metrics(metadata: dict[str, Any]) -> dict[str, float]:
     mean_reward = metadata.get("mean_rewards", metadata.get("mean_reward", float("nan")))
-    return {
+    metrics = {
         "train/loss": float(metadata["loss"]),
         "train/grad_norm": float(metadata["grad_norm"]),
         "train/token_entropy": float(metadata["token_entropy"]),
@@ -402,6 +491,9 @@ def scalar_train_metrics(metadata: dict[str, Any]) -> dict[str, float]:
         "train/format_reward": float(metadata["mean_format_reward"]),
         "train/answer_reward": float(metadata["mean_answer_reward"]),
     }
+    if "clip_fraction" in metadata:
+        metrics["train/clip_fraction"] = float(metadata["clip_fraction"])
+    return metrics
 
 
 def save_checkpoint(model, tokenizer, output_dir: Path, name: str) -> None:
@@ -426,6 +518,10 @@ def main() -> None:
         args.prompt,
         args.reward_fn,
     )
+
+    cliprange = resolve_cliprange(args)
+    train_batches_per_rollout = args.rollout_batch_size // args.train_batch_size
+    optimizer_step = 0
 
     train_examples = load_gsm8k(args.train_data)
     val_examples = load_gsm8k(args.val_data)
@@ -572,28 +668,56 @@ def main() -> None:
             rollout_seconds = time.perf_counter() - rollout_start
             rollout_responses = [completion.text for completion in completions]
 
+            old_log_probs_seconds = 0.0
+            old_log_prob_batches: list[torch.Tensor | None]
+            if args.importance_reweighting_method == "none":
+                old_log_prob_batches = [None] * train_batches_per_rollout
+            else:
+                old_log_probs_start = time.perf_counter()
+                old_log_prob_batches = compute_old_log_prob_batches(
+                    policy,
+                    tokenizer,
+                    repeated_prompts,
+                    rollout_responses,
+                    args.train_batch_size,
+                )
+                old_log_probs_seconds = time.perf_counter() - old_log_probs_start
+
             policy.train()
             train_start = time.perf_counter()
-            _, train_metadata = grpo_train_step(
-                model=policy,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
-                max_grad_norm=args.max_grad_norm,
-                reward_fn=reward_fn,
-                repeated_prompts=repeated_prompts,
-                rollout_responses=rollout_responses,
-                repeated_ground_truths=repeated_ground_truths,
-                group_size=args.group_size,
-                baseline=args.baseline,
-                advantage_eps=args.advantage_eps,
-                advantage_normalizer=args.advantage_normalizer,
-                importance_reweighting_method=args.importance_reweighting_method,
-                old_log_probs=None,
-                cliprange=None,
-                loss_normalization=args.loss_normalization,
-                normalization_constant=args.normalization_constant,
-            )
+            train_metadata_parts: list[tuple[int, dict[str, Any]]] = []
+            for train_batch_index, start in enumerate(
+                range(0, args.rollout_batch_size, args.train_batch_size)
+            ):
+                end = start + args.train_batch_size
+                old_log_probs = old_log_prob_batches[train_batch_index]
+                if old_log_probs is not None:
+                    old_log_probs = old_log_probs.to(policy_device)
+
+                _, batch_train_metadata = grpo_train_step(
+                    model=policy,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    max_grad_norm=args.max_grad_norm,
+                    reward_fn=reward_fn,
+                    repeated_prompts=repeated_prompts[start:end],
+                    rollout_responses=rollout_responses[start:end],
+                    repeated_ground_truths=repeated_ground_truths[start:end],
+                    group_size=args.group_size,
+                    baseline=args.baseline,
+                    advantage_eps=args.advantage_eps,
+                    advantage_normalizer=args.advantage_normalizer,
+                    importance_reweighting_method=args.importance_reweighting_method,
+                    old_log_probs=old_log_probs,
+                    cliprange=cliprange,
+                    loss_normalization=args.loss_normalization,
+                    normalization_constant=args.normalization_constant,
+                )
+                optimizer_step += 1
+                train_metadata_parts.append((end - start, batch_train_metadata))
+
+            train_metadata = aggregate_train_metadata(train_metadata_parts)
             train_seconds = time.perf_counter() - train_start
 
             log_payload: dict[str, Any] = {
@@ -601,7 +725,10 @@ def main() -> None:
                 **scalar_train_metrics(train_metadata),
                 "time/weight_sync_seconds": sync_seconds,
                 "time/rollout_seconds": rollout_seconds,
+                "time/old_log_probs_seconds": old_log_probs_seconds,
                 "time/train_seconds": train_seconds,
+                "train/optimizer_step": optimizer_step,
+                "train/updates_per_rollout": train_batches_per_rollout,
                 "system/max_memory_allocated_gb": torch.cuda.max_memory_allocated(
                     args.train_gpu
                 )
@@ -683,6 +810,7 @@ def main() -> None:
 
             message = (
                 f"step={step:04d} "
+                f"optimizer_step={optimizer_step:05d} "
                 f"loss={log_payload['train/loss']:.5f} "
                 f"train_reward={log_payload['train/reward']:.4f} "
                 f"format={log_payload['train/format_reward']:.4f} "

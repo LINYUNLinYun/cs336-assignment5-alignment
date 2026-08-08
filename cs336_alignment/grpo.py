@@ -263,12 +263,110 @@ def compute_policy_gradient_loss(
     if importance_reweighting_method == "none":
         per_token_policy_gradient_loss = -advantages*policy_log_probs
         return per_token_policy_gradient_loss, metadata
+
+    if old_log_probs is None:
+        raise ValueError(
+            f"old_log_probs is required for {importance_reweighting_method}"
+        )
+    if old_log_probs.shape != policy_log_probs.shape:
+        raise ValueError(
+            f"old_log_probs must have shape {policy_log_probs.shape}, "
+            f"got {old_log_probs.shape}"
+        )
+
+    old_log_probs = old_log_probs.detach()
+    log_ratio = policy_log_probs - old_log_probs
+
+    if importance_reweighting_method == "noclip":
+        ratio = torch.exp(log_ratio)    # 指数对数运算
+        per_token_policy_gradient_loss = -advantages * ratio
+        metadata["importance_weight"] = ratio.detach()
+        return per_token_policy_gradient_loss, metadata
+
     elif importance_reweighting_method == "grpo":
-        raise NotImplementedError
+        if cliprange is None:
+            raise ValueError("cliprange is required for grpo")
+
+        ratio = torch.exp(log_ratio)
+        clipped_ratio = torch.clamp(
+            ratio,
+            1.0 - cliprange,
+            1.0 + cliprange,
+        )
+        # 广播 [B, 1] * [B, T]
+        unclipped_objective = advantages * ratio
+        clipped_objective = advantages * clipped_ratio      # 会被约束在一个范围
+
+        per_token_policy_gradient_loss = -torch.minimum(    # 上届取约束的，下届还是取约束的（因为A是-1）
+            unclipped_objective,
+            clipped_objective,
+        )
+
+        clipped = (
+            ((advantages >= 0) & (ratio > 1.0 + cliprange))
+            | ((advantages < 0) & (ratio < 1.0 - cliprange))
+        )
+
+        metadata["importance_weight"] = ratio.detach()
+        metadata["clip_fraction"] = clipped.float().mean().detach()
+
+        return per_token_policy_gradient_loss, metadata
+
     elif importance_reweighting_method == "gspo":
-        raise NotImplementedError
-    elif importance_reweighting_method == "noclip":
-        raise NotImplementedError
+        if cliprange is None:
+            raise ValueError("cliprange is required for gspo")
+        if response_mask is None:
+            raise ValueError("response_mask is required for gspo")
+        if response_mask.shape != policy_log_probs.shape:
+            raise ValueError(
+                f"response_mask must have shape {policy_log_probs.shape}, "
+                f"got {response_mask.shape}"
+            )
+
+        mask = response_mask.to(policy_log_probs.dtype)
+
+        response_lengths = mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        # 只取有效的response token计算
+        sequence_log_ratio = (
+            (log_ratio * mask).sum(dim=-1, keepdim=True)
+            / response_lengths
+        )
+
+        sequence_ratio = torch.exp(sequence_log_ratio)
+
+        clipped_sequence_ratio = torch.clamp(
+            sequence_ratio,
+            1.0 - cliprange,
+            1.0 + cliprange,
+        )
+
+        unclipped_objective = advantages * sequence_ratio
+        clipped_objective = advantages * clipped_sequence_ratio
+
+        sequence_loss = -torch.minimum(
+            unclipped_objective,
+            clipped_objective,
+        )
+
+        per_token_policy_gradient_loss = sequence_loss.expand_as(
+            policy_log_probs
+        )
+
+        clipped = (
+            ((advantages >= 0) & (sequence_ratio > 1.0 + cliprange))
+            | ((advantages < 0) & (sequence_ratio < 1.0 - cliprange))
+        )
+
+        metadata["importance_weight"] = sequence_ratio.detach()
+        metadata["clip_fraction"] = clipped.float().mean().detach()
+
+        return per_token_policy_gradient_loss, metadata
+
+    else:
+        raise ValueError(
+            f"Unknown importance_reweighting_method: "
+            f"{importance_reweighting_method}"
+        )
 
     
 def aggregate_loss_across_microbatch(
@@ -345,7 +443,7 @@ def grpo_train_step(
 
     entropy_sum = torch.zeros((), device=device)
     response_token_count = torch.zeros((), device=device)
-
+    # 剔除0的advantage
     non_zero_advantage = normed_advantage.nonzero(as_tuple=False).flatten().tolist()
 
     for i in range(0, len(non_zero_advantage), microbatch_size):
@@ -371,7 +469,9 @@ def grpo_train_step(
         if importance_reweighting_method == "none":
             per_token_policy_gradient_loss,loss_metadata =compute_policy_gradient_loss(microbatch_advantage,log_probs,importance_reweighting_method) 
         else:
-            raise NotImplementedError
+            microbatch_old_log_probs = old_log_probs[active_indices,:log_probs.shape[1],].to(device)        # 这里对old probs截断是因为它用的max len padding
+            per_token_policy_gradient_loss,loss_metadata =compute_policy_gradient_loss(
+            microbatch_advantage,log_probs,importance_reweighting_method,microbatch_old_log_probs,cliprange,response_mask) 
         # 聚合不同序列的损失
         if loss_normalization == "sequence":
             loss = aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask,loss_normalization,)
